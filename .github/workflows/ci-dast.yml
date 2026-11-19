@@ -1,5 +1,5 @@
 # Build patch-mutual, run it in an ephemeral container, and scan it with
-# Snyk API & Web (DAST) through a scanning agent on the same Docker network.
+# Snyk API & Web (DAST) through a userspace scanning agent running on the runner.
 name: Build and Snyk API & Web DAST
 
 on:
@@ -15,7 +15,13 @@ permissions:
 env:
   # Must match the hostname in the Snyk API & Web target URL (http://patch-mutual:8080).
   APP_HOSTNAME: patch-mutual
-  DOCKER_NETWORK: dast-net
+  # Userspace scanning agent from Snyk's public examples repo, pinned to a commit
+  # and verified by checksum. (The Docker agent needs iptables nat, which hosted
+  # runners don't have.)
+  AGENT_REPO: Probely/cicd-pipeline-scan-examples
+  AGENT_REF: 7639aabaaa78862a3eff6e6aa5a6d15be2bf56a2
+  AGENT_BIN: snyk-agent/scanning-agent/farcasterd-linux-amd64-0.4.3
+  AGENT_SHA256: 34cc3ec4e89b589bedd60982b4c69a3ec7e4b3973330981459e1e202f92f6d31
 
 jobs:
   build:
@@ -56,8 +62,9 @@ jobs:
       PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
       AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
       TARGET_ID: ${{ vars.TARGET_ID }}
-      # Optional: set for non-EU tenants (the CLI defaults to https://api.probely.com/).
-      PROBELY_API_BASE_URL: ${{ vars.PROBELY_API_BASE_URL }}
+      # US region by default (what this tenant's agent reports). Override with the
+      # repo variable PROBELY_API_BASE_URL for another region.
+      PROBELY_API_BASE_URL: ${{ vars.PROBELY_API_BASE_URL || 'https://api.us.probely.com/' }}
       # Set the repo variable DAST_FAIL_ON_HIGH=true to fail the build on High findings.
       FAIL_ON_HIGH: ${{ vars.DAST_FAIL_ON_HIGH }}
     steps:
@@ -71,45 +78,55 @@ jobs:
           done
           exit $missing
 
-      - name: Create Docker network
-        run: docker network create "$DOCKER_NETWORK"
-
       - name: Build and run the app
         run: |
           docker build -t patch-mutual .
-          docker run -d --name "$APP_HOSTNAME" --network "$DOCKER_NETWORK" \
-            --network-alias "$APP_HOSTNAME" -p 8080:8080 patch-mutual
+          docker run -d --name "$APP_HOSTNAME" -p 8080:8080 patch-mutual
+          # The agent resolves the target hostname through the runner's /etc/hosts.
+          echo "127.0.0.1 $APP_HOSTNAME" | sudo tee -a /etc/hosts
 
       - name: Wait for the app
         run: |
           for i in $(seq 1 60); do
-            if curl -fs -o /dev/null http://localhost:8080/; then echo "App is up"; exit 0; fi
+            if curl -fs -o /dev/null "http://$APP_HOSTNAME:8080/"; then echo "App is up"; exit 0; fi
             echo "Waiting for the app ($i/60)..."; sleep 5
           done
           echo "::error::App did not become ready"; docker logs "$APP_HOSTNAME" | tail -50; exit 1
 
+      - name: Fetch scanning agent
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.AGENT_REPO }}
+          ref: ${{ env.AGENT_REF }}
+          path: snyk-agent
+          sparse-checkout: scanning-agent
+
       - name: Start Snyk API & Web scanning agent
         run: |
-          docker run -d --name probely-agent \
-            --cap-add NET_ADMIN --device /dev/net/tun \
-            --network "$DOCKER_NETWORK" \
-            -e FARCASTER_AGENT_TOKEN="$AGENT_TOKEN" \
-            probely/farcaster-onprem-agent:v2
+          echo "$AGENT_SHA256  $AGENT_BIN" | sha256sum -c -
+          chmod +x "$AGENT_BIN"
+          umask 077
+          printf '%s' "$AGENT_TOKEN" > "$RUNNER_TEMP/agent.token"
+          "$AGENT_BIN" --check-token --token "$RUNNER_TEMP/agent.token"
+          nohup "$AGENT_BIN" --debug --token "$RUNNER_TEMP/agent.token" \
+            --log "$RUNNER_TEMP/agent.log" > /dev/null 2>&1 &
+          echo "AGENT_PID=$!" >> "$GITHUB_ENV"
 
       - name: Wait for the agent
         run: |
-          for i in $(seq 1 30); do
-            if docker logs probely-agent 2>&1 | grep -q 'Running...'; then
-              echo "Agent is running"; sleep 10; exit 0
+          for i in $(seq 1 20); do
+            if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+              echo "::error::Scanning agent exited"; cat "$RUNNER_TEMP/agent.log"; exit 1
             fi
-            echo "Waiting for the agent ($i/30)..."; sleep 3
+            [ -s "$RUNNER_TEMP/agent.log" ] && grep -qiE 'connected|running|established|handshake' "$RUNNER_TEMP/agent.log" && break
+            echo "Waiting for the agent ($i/20)..."; sleep 3
           done
-          echo "::error::Scanning agent did not start"; docker logs probely-agent | tail -50; exit 1
+          echo "--- agent log (tail) ---"; tail -20 "$RUNNER_TEMP/agent.log"
 
       - name: Install Snyk API & Web CLI
         run: |
           pip install probely
-          probely targets get "$TARGET_ID" > /dev/null   # fails fast on a bad key or target ID
+          probely targets get "$TARGET_ID" > /dev/null   # fails fast on a bad key, region or target ID
 
       - name: Start scan
         run: |
@@ -156,14 +173,15 @@ jobs:
             echo "::error::$HIGHS High severity finding(s)"; exit 1
           fi
 
-      - name: Container logs (on failure)
+      - name: Logs (on failure)
         if: failure()
         run: |
-          docker logs "$APP_HOSTNAME" 2>&1 | tail -100 || true
-          docker logs probely-agent 2>&1 | tail -100 || true
+          echo "--- app ---";   docker logs "$APP_HOSTNAME" 2>&1 | tail -100 || true
+          echo "--- agent ---"; tail -100 "$RUNNER_TEMP/agent.log" 2>/dev/null || true
 
       - name: Clean up
         if: always()
         run: |
-          docker rm -f "$APP_HOSTNAME" probely-agent 2>/dev/null || true
-          docker network rm "$DOCKER_NETWORK" 2>/dev/null || true
+          [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/agent.token"
+          docker rm -f "$APP_HOSTNAME" 2>/dev/null || true
