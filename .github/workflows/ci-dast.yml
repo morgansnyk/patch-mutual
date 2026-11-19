@@ -32,7 +32,7 @@ jobs:
 
       # The repo's Gradle 6.5 wrapper needs JDK <= 14 (build.gradle uses archiveName,
       # which Gradle 8 removed). JDK 11 matches the Dockerfile.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '11'
@@ -82,8 +82,15 @@ jobs:
         run: |
           docker build -t patch-mutual .
           docker run -d --name "$APP_HOSTNAME" -p 8080:8080 patch-mutual
+
+      - name: Map target hostname to the container
+        run: |
           # The agent resolves the target hostname through the runner's /etc/hosts.
-          echo "127.0.0.1 $APP_HOSTNAME" | sudo tee -a /etc/hosts
+          # Use the container IP (not 127.0.0.1) and add the trailing-dot form too,
+          # as in Snyk's ephemeral-app example.
+          CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$APP_HOSTNAME")
+          echo "Container IP: $CONTAINER_IP"
+          echo "$CONTAINER_IP $APP_HOSTNAME $APP_HOSTNAME." | sudo tee -a /etc/hosts
 
       - name: Wait for the app
         run: |
@@ -114,12 +121,12 @@ jobs:
 
       - name: Wait for the agent
         run: |
-          for i in $(seq 1 20); do
+          # Give the agent time to connect to the Snyk hub, failing early if it died.
+          for i in $(seq 1 10); do
             if ! kill -0 "$AGENT_PID" 2>/dev/null; then
               echo "::error::Scanning agent exited"; cat "$RUNNER_TEMP/agent.log"; exit 1
             fi
-            [ -s "$RUNNER_TEMP/agent.log" ] && grep -qiE 'connected|running|established|handshake' "$RUNNER_TEMP/agent.log" && break
-            echo "Waiting for the agent ($i/20)..."; sleep 3
+            sleep 3
           done
           echo "--- agent log (tail) ---"; tail -20 "$RUNNER_TEMP/agent.log"
 
