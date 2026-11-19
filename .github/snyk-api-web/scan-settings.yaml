@@ -1,0 +1,10 @@
+# Settings for the scan started by .github/workflows/scan-existing-target.yml
+#
+# This file is passed to the CLI as `probely targets start-scan <TARGET_ID> -f <this file>`
+# and is sent as the body of Snyk API & Web's "scan now" API call, so it accepts the
+# fields documented for that endpoint: https://developers.probely.com/
+#
+# Run the scan with this profile instead of the target's default profile.
+# Built-in profiles: lightning (under a minute), safe, normal, full.
+# A custom profile's ID works here too.
+scan_profile: lightning
