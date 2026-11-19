@@ -1,0 +1,169 @@
+# Build patch-mutual, run it in an ephemeral container, and scan it with
+# Snyk API & Web (DAST) through a scanning agent on the same Docker network.
+name: Build and Snyk API & Web DAST
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Must match the hostname in the Snyk API & Web target URL (http://patch-mutual:8080).
+  APP_HOSTNAME: patch-mutual
+  DOCKER_NETWORK: dast-net
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repo's Gradle 6.5 wrapper needs JDK <= 14 (build.gradle uses archiveName,
+      # which Gradle 8 removed). JDK 11 matches the Dockerfile.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Build WAR
+        run: |
+          chmod +x gradlew
+          ./gradlew clean build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: altoromutual-war
+          path: build/libs/altoromutual.war
+          if-no-files-found: error
+
+  dast:
+    needs: build
+    # Fork PRs have no access to secrets, so skip them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Only one scan of the target at a time.
+    concurrency:
+      group: snyk-api-web-dast
+      cancel-in-progress: false
+    env:
+      PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
+      AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
+      TARGET_ID: ${{ vars.TARGET_ID }}
+      # Optional: set for non-EU tenants (the CLI defaults to https://api.probely.com/).
+      PROBELY_API_BASE_URL: ${{ vars.PROBELY_API_BASE_URL }}
+      # Set the repo variable DAST_FAIL_ON_HIGH=true to fail the build on High findings.
+      FAIL_ON_HIGH: ${{ vars.DAST_FAIL_ON_HIGH }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets and variables
+        run: |
+          missing=0
+          for v in PROBELY_API_KEY AGENT_TOKEN TARGET_ID; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Create Docker network
+        run: docker network create "$DOCKER_NETWORK"
+
+      - name: Build and run the app
+        run: |
+          docker build -t patch-mutual .
+          docker run -d --name "$APP_HOSTNAME" --network "$DOCKER_NETWORK" \
+            --network-alias "$APP_HOSTNAME" -p 8080:8080 patch-mutual
+
+      - name: Wait for the app
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fs -o /dev/null http://localhost:8080/; then echo "App is up"; exit 0; fi
+            echo "Waiting for the app ($i/60)..."; sleep 5
+          done
+          echo "::error::App did not become ready"; docker logs "$APP_HOSTNAME" | tail -50; exit 1
+
+      - name: Start Snyk API & Web scanning agent
+        run: |
+          docker run -d --name probely-agent \
+            --cap-add NET_ADMIN --device /dev/net/tun \
+            --network "$DOCKER_NETWORK" \
+            -e FARCASTER_AGENT_TOKEN="$AGENT_TOKEN" \
+            probely/farcaster-onprem-agent:v2
+
+      - name: Wait for the agent
+        run: |
+          for i in $(seq 1 30); do
+            if docker logs probely-agent 2>&1 | grep -q 'Running...'; then
+              echo "Agent is running"; sleep 10; exit 0
+            fi
+            echo "Waiting for the agent ($i/30)..."; sleep 3
+          done
+          echo "::error::Scanning agent did not start"; docker logs probely-agent | tail -50; exit 1
+
+      - name: Install Snyk API & Web CLI
+        run: |
+          pip install probely
+          probely targets get "$TARGET_ID" > /dev/null   # fails fast on a bad key or target ID
+
+      - name: Start scan
+        run: |
+          SCAN_ID=""
+          for i in $(seq 1 20); do
+            if SCAN_ID=$(probely targets start-scan "$TARGET_ID" -o IDS_ONLY) && [ -n "$SCAN_ID" ]; then
+              echo "Scan started: $SCAN_ID"
+              echo "SCAN_ID=$SCAN_ID" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Scan did not start, retrying ($i/20)..."; sleep 5
+          done
+          echo "::error::Could not start a scan"; exit 1
+
+      - name: Wait for scan to finish
+        run: |
+          for i in $(seq 1 120); do   # up to 60 minutes
+            STATUS=$(probely scans get "$SCAN_ID" -o JSON | jq -r '.status')
+            echo "Scan status: $STATUS"
+            case "$STATUS" in
+              queued|started) sleep 30 ;;
+              failed|canceled|cancelled) echo "::error::Scan ended with status $STATUS"; exit 1 ;;
+              *) exit 0 ;;
+            esac
+          done
+          echo "::error::Timed out waiting for the scan"; exit 1
+
+      - name: Report findings and apply gate
+        run: |
+          JSON=$(probely scans get "$SCAN_ID" -o JSON)
+          HIGHS=$(echo "$JSON" | jq -r '.highs // 0')
+          MEDIUMS=$(echo "$JSON" | jq -r '.mediums // 0')
+          LOWS=$(echo "$JSON" | jq -r '.lows // 0')
+          {
+            echo "### Snyk API & Web DAST scan"
+            echo "Scan \`$SCAN_ID\` on target \`$TARGET_ID\`"
+            echo ""
+            echo "| High | Medium | Low |"
+            echo "|---|---|---|"
+            echo "| $HIGHS | $MEDIUMS | $LOWS |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "High: $HIGHS  Medium: $MEDIUMS  Low: $LOWS"
+          if [ "$HIGHS" -gt 0 ] && [ "$FAIL_ON_HIGH" = "true" ]; then
+            echo "::error::$HIGHS High severity finding(s)"; exit 1
+          fi
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          docker logs "$APP_HOSTNAME" 2>&1 | tail -100 || true
+          docker logs probely-agent 2>&1 | tail -100 || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f "$APP_HOSTNAME" probely-agent 2>/dev/null || true
+          docker network rm "$DOCKER_NETWORK" 2>/dev/null || true
