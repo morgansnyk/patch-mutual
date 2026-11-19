@@ -1,26 +1,58 @@
-# Start a Snyk API & Web scan on an EXISTING target, using the settings in a YAML file.
-# No app is built or started here: the target must already be reachable by Snyk
-# (a public URL, or an internal one with a scanning agent already running).
+# Start a Snyk API & Web scan on an EXISTING target, using settings kept in the repo.
+#
+# Settings (target ID, scan profile, severity gate) come from a YAML file in the repo
+# that runs the workflow (default: .github/snyk-api-web/scan-settings.yaml).
+#
+# Use it as a shared ("global") workflow: keep this file in one repo and call it from
+# others with a settings file of their own:
+#
+#   jobs:
+#     dast:
+#       uses: morgansnyk/patch-mutual/.github/workflows/scan-existing-target.yml@main
+#       secrets: inherit
+#
+# No app is built or started: the target must already be reachable by Snyk (a public
+# URL, or an internal one with a scanning agent already running).
 name: Snyk API & Web scan (existing target)
 
 on:
   workflow_dispatch:
     inputs:
-      target_id:
-        description: Target ID to scan (defaults to the EXISTING_TARGET_ID repo variable)
-        required: false
-        type: string
       settings_file:
-        description: Scan settings YAML in this repo
+        description: Settings YAML in this repo (default .github/snyk-api-web/scan-settings.yaml)
         required: false
-        default: .github/snyk-api-web/scan-settings.yaml
+        default: ''
+        type: string
+      target_id:
+        description: Override target_id from the settings file
+        required: false
+        default: ''
         type: string
       fail_on:
-        description: Fail the run if the scan finds this severity or worse
+        description: Override fail_on from the settings file (none, critical, high, medium, low)
         required: false
-        default: none
-        type: choice
-        options: [ none, critical, high, medium, low ]
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      settings_file:
+        description: Settings YAML in the calling repo
+        required: false
+        default: ''
+        type: string
+      target_id:
+        description: Override target_id from the settings file
+        required: false
+        default: ''
+        type: string
+      fail_on:
+        description: Override fail_on from the settings file
+        required: false
+        default: ''
+        type: string
+    secrets:
+      PROBELY_API_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -30,42 +62,86 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
-      group: snyk-api-web-existing-${{ inputs.target_id || vars.EXISTING_TARGET_ID }}
+      group: snyk-api-web-existing-${{ github.repository }}
       cancel-in-progress: false
     env:
       PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
       # US region by default. Override with the repo variable PROBELY_API_BASE_URL.
       PROBELY_API_BASE_URL: ${{ vars.PROBELY_API_BASE_URL || 'https://api.us.probely.com/' }}
-      TARGET_ID: ${{ inputs.target_id || vars.EXISTING_TARGET_ID }}
-      SETTINGS_FILE: ${{ inputs.settings_file }}
-      FAIL_ON: ${{ inputs.fail_on }}
     steps:
+      # In a reusable workflow this checks out the CALLING repo, so its settings file is used.
       - uses: actions/checkout@v4
 
-      - name: Check inputs
+      - name: Check API key
         run: |
-          missing=0
-          if [ -z "$PROBELY_API_KEY" ]; then echo "::error::Secret PROBELY_API_KEY is not set"; missing=1; fi
-          if [ -z "$TARGET_ID" ]; then echo "::error::Provide target_id or set the EXISTING_TARGET_ID repo variable"; missing=1; fi
-          if [ ! -f "$SETTINGS_FILE" ]; then echo "::error::Settings file not found: $SETTINGS_FILE"; missing=1; fi
-          exit $missing
+          if [ -z "$PROBELY_API_KEY" ]; then echo "::error::Secret PROBELY_API_KEY is not set"; exit 1; fi
 
       - name: Install Snyk API & Web CLI
-        run: |
-          pip install probely
-          probely targets get "$TARGET_ID"   # fails fast on a bad key, region or target ID
+        run: pip install probely
 
-      - name: Show scan settings
+      - name: Load settings
+        env:
+          CONFIG_FILE: ${{ inputs.settings_file || '.github/snyk-api-web/scan-settings.yaml' }}
+          IN_TARGET: ${{ inputs.target_id }}
+          IN_FAIL_ON: ${{ inputs.fail_on }}
+          VAR_TARGET: ${{ vars.EXISTING_TARGET_ID }}
         run: |
-          echo "### Scan settings" >> "$GITHUB_STEP_SUMMARY"
-          { echo '```yaml'; cat "$SETTINGS_FILE"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          cat "$SETTINGS_FILE"
+          python3 - <<'PY'
+          import os, re, sys, yaml
 
-      - name: Start scan with settings file
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          path = os.environ["CONFIG_FILE"]
+          cfg = {}
+          if os.path.isfile(path):
+              cfg = yaml.safe_load(open(path)) or {}
+              if not isinstance(cfg, dict):
+                  fail(f"{path} must be a YAML mapping")
+          else:
+              print(f"::notice::No settings file at {path}; using inputs and defaults")
+
+          target = (os.environ.get("IN_TARGET") or str(cfg.get("target_id") or "") or os.environ.get("VAR_TARGET") or "").strip()
+          fail_on = (os.environ.get("IN_FAIL_ON") or str(cfg.get("fail_on") or "none")).strip().lower()
+
+          if not re.fullmatch(r"[A-Za-z0-9]{6,32}", target):
+              fail("No valid target_id: set it in the settings file, the target_id input, or the EXISTING_TARGET_ID variable")
+          if fail_on not in ("none", "critical", "high", "medium", "low"):
+              fail(f"fail_on must be none, critical, high, medium or low (got '{fail_on}')")
+
+          scan = cfg.get("scan") or {}
+          if not isinstance(scan, dict):
+              fail("'scan' in the settings file must be a mapping")
+
+          env_lines = [f"TARGET_ID={target}", f"FAIL_ON={fail_on}"]
+          if scan:
+              payload = os.path.join(os.environ["RUNNER_TEMP"], "scan-payload.yaml")
+              with open(payload, "w") as f:
+                  yaml.safe_dump(scan, f, sort_keys=False)
+              env_lines.append(f"SCAN_PAYLOAD={payload}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("\n".join(env_lines) + "\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("### Scan settings\n")
+              f.write(f"- Settings file: `{path}`" + ("" if os.path.isfile(path) else " (not found)") + "\n")
+              f.write(f"- Target: `{target}`\n- Fail on: `{fail_on}`\n")
+              if scan:
+                  f.write("\n```yaml\n" + yaml.safe_dump(scan, sort_keys=False) + "```\n")
+          print(f"Target: {target}  Fail on: {fail_on}  Scan settings: {scan or 'none (target defaults)'}")
+          PY
+
+      - name: Check target
+        run: probely targets get "$TARGET_ID"   # fails fast on a bad key, region or target ID
+
+      - name: Start scan
         run: |
+          ARGS=()
+          if [ -n "$SCAN_PAYLOAD" ]; then ARGS=(-f "$SCAN_PAYLOAD"); fi
           SCAN_ID=""
           for i in $(seq 1 20); do
-            if SCAN_ID=$(probely targets start-scan "$TARGET_ID" -f "$SETTINGS_FILE" -o IDS_ONLY) && [ -n "$SCAN_ID" ]; then
+            if SCAN_ID=$(probely targets start-scan "$TARGET_ID" "${ARGS[@]}" -o IDS_ONLY) && [ -n "$SCAN_ID" ]; then
               echo "Scan started: $SCAN_ID"
               echo "SCAN_ID=$SCAN_ID" >> "$GITHUB_ENV"
               exit 0
