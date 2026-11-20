@@ -13,6 +13,16 @@ target_id: 3euj5LTwKwh3
 # none | critical | high | medium | low
 fail_on: none
 
+# Log in during the scan (form login). The password is NEVER stored here: add the repo
+# secrets SCAN_LOGIN_USERNAME and SCAN_LOGIN_PASSWORD. Omit this whole section to scan
+# without logging in. If the secrets are missing, the scan runs unauthenticated.
+auth:
+  type: form
+  login_url: http://www.patchmutual.com/login.jsp
+  username_field: uid        # name of the username input on the login form
+  password_field: passw      # name of the password input on the login form
+  check_pattern: Sign Off    # text that only appears on pages when logged in
+
 # Everything under "scan" is passed to the CLI (targets start-scan -f) and sent as the
 # body of Snyk API & Web's "scan now" API call, so it accepts the fields documented
 # for that endpoint: https://developers.probely.com/
