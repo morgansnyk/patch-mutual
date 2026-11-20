@@ -135,6 +135,43 @@ jobs:
           pip install probely
           probely targets get "$TARGET_ID" > /dev/null   # fails fast on a bad key, region or target ID
 
+      - name: Apply target login
+        env:
+          AUTH_LOGIN_URL: http://${{ env.APP_HOSTNAME }}:8080/login.jsp
+          AUTH_USER_FIELD: uid
+          AUTH_PASS_FIELD: passw
+          AUTH_CHECK: Sign Off
+          AUTH_USERNAME: ''
+          SECRET_USERNAME: ${{ secrets.SCAN_LOGIN_USERNAME }}
+          LOGIN_PASSWORD: ${{ secrets.SCAN_LOGIN_PASSWORD }}
+        run: |
+          if [ -z "$AUTH_LOGIN_URL" ]; then echo "No login configured; scanning without authentication"; exit 0; fi
+          LOGIN_USERNAME="${SECRET_USERNAME:-$AUTH_USERNAME}"
+          export LOGIN_USERNAME
+          if [ -z "$LOGIN_USERNAME" ] || [ -z "$LOGIN_PASSWORD" ]; then
+            echo "::warning::Login is configured but the SCAN_LOGIN_USERNAME / SCAN_LOGIN_PASSWORD secrets are missing; scanning without authentication"
+            exit 0
+          fi
+          echo "::add-mask::$LOGIN_PASSWORD"
+          umask 077
+          python3 - <<'PY'
+          import os, yaml
+          payload = {
+              "has_form_login": True,
+              "form_login_url": os.environ["AUTH_LOGIN_URL"],
+              "form_login_check_pattern": os.environ["AUTH_CHECK"],
+              "form_login": [
+                  {"name": os.environ["AUTH_USER_FIELD"], "value": os.environ["LOGIN_USERNAME"]},
+                  {"name": os.environ["AUTH_PASS_FIELD"], "value": os.environ["LOGIN_PASSWORD"]},
+              ],
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "auth-payload.yaml"), "w") as f:
+              yaml.safe_dump(payload, f, sort_keys=False)
+          PY
+          probely targets update "$TARGET_ID" -f "$RUNNER_TEMP/auth-payload.yaml" -o IDS_ONLY > /dev/null
+          rm -f "$RUNNER_TEMP/auth-payload.yaml"
+          echo "Form login applied to target $TARGET_ID (user: $LOGIN_USERNAME)"
+
       - name: Start scan
         run: |
           SCAN_ID=""
