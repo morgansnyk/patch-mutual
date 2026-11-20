@@ -53,6 +53,10 @@ on:
     secrets:
       PROBELY_API_KEY:
         required: false
+      SCAN_LOGIN_USERNAME:
+        required: false
+      SCAN_LOGIN_PASSWORD:
+        required: false
 
 permissions:
   contents: read
@@ -114,7 +118,31 @@ jobs:
           if not isinstance(scan, dict):
               fail("'scan' in the settings file must be a mapping")
 
+          auth = cfg.get("auth") or {}
+          if not isinstance(auth, dict):
+              fail("'auth' in the settings file must be a mapping")
+
           env_lines = [f"TARGET_ID={target}", f"FAIL_ON={fail_on}"]
+          if auth:
+              if str(auth.get("type", "form")) != "form":
+                  fail("Only auth.type: form is supported")
+              fields = {
+                  "AUTH_LOGIN_URL": auth.get("login_url"),
+                  "AUTH_USER_FIELD": auth.get("username_field"),
+                  "AUTH_PASS_FIELD": auth.get("password_field"),
+                  "AUTH_CHECK": auth.get("check_pattern"),
+                  "AUTH_USERNAME": auth.get("username") or "",
+              }
+              for key, val in fields.items():
+                  val = str(val or "").strip()
+                  if re.search(r"[\r\n]", val):
+                      fail(f"auth value for {key} must be a single line")
+                  if not val and key != "AUTH_USERNAME":
+                      fail("auth needs login_url, username_field, password_field and check_pattern")
+                  fields[key] = val
+              if not fields["AUTH_LOGIN_URL"].startswith(("http://", "https://")):
+                  fail("auth.login_url must start with http:// or https://")
+              env_lines += [f"{k}={v}" for k, v in fields.items()]
           if scan:
               payload = os.path.join(os.environ["RUNNER_TEMP"], "scan-payload.yaml")
               with open(payload, "w") as f:
@@ -127,6 +155,8 @@ jobs:
               f.write("### Scan settings\n")
               f.write(f"- Settings file: `{path}`" + ("" if os.path.isfile(path) else " (not found)") + "\n")
               f.write(f"- Target: `{target}`\n- Fail on: `{fail_on}`\n")
+              if auth:
+                  f.write(f"- Login: form at `{fields['AUTH_LOGIN_URL']}`\n")
               if scan:
                   f.write("\n```yaml\n" + yaml.safe_dump(scan, sort_keys=False) + "```\n")
           print(f"Target: {target}  Fail on: {fail_on}  Scan settings: {scan or 'none (target defaults)'}")
@@ -134,6 +164,38 @@ jobs:
 
       - name: Check target
         run: probely targets get "$TARGET_ID"   # fails fast on a bad key, region or target ID
+
+      - name: Apply target login
+        env:
+          SECRET_USERNAME: ${{ secrets.SCAN_LOGIN_USERNAME }}
+          LOGIN_PASSWORD: ${{ secrets.SCAN_LOGIN_PASSWORD }}
+        run: |
+          if [ -z "$AUTH_LOGIN_URL" ]; then echo "No login configured; scanning without authentication"; exit 0; fi
+          LOGIN_USERNAME="${SECRET_USERNAME:-$AUTH_USERNAME}"
+          export LOGIN_USERNAME
+          if [ -z "$LOGIN_USERNAME" ] || [ -z "$LOGIN_PASSWORD" ]; then
+            echo "::warning::Login is configured but the SCAN_LOGIN_USERNAME / SCAN_LOGIN_PASSWORD secrets are missing; scanning without authentication"
+            exit 0
+          fi
+          echo "::add-mask::$LOGIN_PASSWORD"
+          umask 077
+          python3 - <<'PY'
+          import os, yaml
+          payload = {
+              "has_form_login": True,
+              "form_login_url": os.environ["AUTH_LOGIN_URL"],
+              "form_login_check_pattern": os.environ["AUTH_CHECK"],
+              "form_login": [
+                  {"name": os.environ["AUTH_USER_FIELD"], "value": os.environ["LOGIN_USERNAME"]},
+                  {"name": os.environ["AUTH_PASS_FIELD"], "value": os.environ["LOGIN_PASSWORD"]},
+              ],
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "auth-payload.yaml"), "w") as f:
+              yaml.safe_dump(payload, f, sort_keys=False)
+          PY
+          probely targets update "$TARGET_ID" -f "$RUNNER_TEMP/auth-payload.yaml" -o IDS_ONLY > /dev/null
+          rm -f "$RUNNER_TEMP/auth-payload.yaml"
+          echo "Form login applied to target $TARGET_ID (user: $LOGIN_USERNAME)"
 
       - name: Start scan
         run: |
